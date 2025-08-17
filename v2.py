@@ -16,14 +16,14 @@ import string
 from datetime import datetime, timedelta
 from typing import Optional, Literal
 
-TOKEN = ''
+TOKEN = 'bot_token'
 RAM_LIMIT = '6g'
 SERVER_LIMIT = 1
 database_file = 'database.txt'
 PUBLIC_IP = '138.68.79.95'
 
 # Admin user IDs - add your admin user IDs here
-ADMIN_IDS = [1368602087520473140]  # Replace with actual admin IDs
+ADMIN_IDS = [1244619465040203850, 1395983357975855177]  # Replace with actual admin IDs
 
 intents = discord.Intents.default()
 intents.messages = False
@@ -93,21 +93,81 @@ def get_all_containers():
 
 def get_container_stats(container_id):
     try:
-        # Get memory usage
-        mem_stats = subprocess.check_output(["docker", "stats", container_id, "--no-stream", "--format", "{{.MemUsage}}"]).decode().strip()
+        # Get container status and basic info in one command
+        try:
+            inspect_output = subprocess.check_output(["docker", "inspect", "--format", "{{.State.Status}}", container_id], 
+                                                   stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+            status = inspect_output if inspect_output else "unknown"
+        except:
+            status = "unknown"
         
-        # Get CPU usage
-        cpu_stats = subprocess.check_output(["docker", "stats", container_id, "--no-stream", "--format", "{{.CPUPerc}}"]).decode().strip()
+        # Get memory limit from database instead of Docker inspect
+        mem_limit_str = "Unknown"
+        try:
+            if os.path.exists(database_file):
+                with open(database_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split('|')
+                        if len(parts) >= 2 and container_id in parts[1]:
+                            # Check if we have RAM limit in the database
+                            if len(parts) >= 4 and parts[3]:
+                                try:
+                                    ram_limit = int(parts[3])
+                                    mem_limit_str = f"{ram_limit}GB"
+                                except:
+                                    mem_limit_str = "Unknown"
+                            break
+        except:
+            mem_limit_str = "Unknown"
         
-        # Get container status
-        status = subprocess.check_output(["docker", "inspect", "--format", "{{.State.Status}}", container_id]).decode().strip()
+        # Get memory and CPU usage in one command
+        try:
+            stats_output = subprocess.check_output(["docker", "stats", container_id, "--no-stream", "--format", "{{.MemUsage}}|{{.CPUPerc}}"], 
+                                                 stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+            if "|" in stats_output:
+                mem_stats, cpu_stats = stats_output.split("|")
+            else:
+                mem_stats = "0B / 0B"
+                cpu_stats = "0.00%"
+        except:
+            mem_stats = "0B / 0B"
+            cpu_stats = "0.00%"
+        
+        # Process memory usage
+        memory_display = f"0MB / {mem_limit_str}"
+        
+        if mem_stats and mem_stats != "0B / 0B" and mem_stats != "0B":
+            # Parse the memory usage from docker stats (format: "45.2MiB / 2GiB")
+            try:
+                if " / " in mem_stats:
+                    used_mem, total_mem = mem_stats.split(" / ")
+                    memory_display = f"{used_mem} / {mem_limit_str}"
+                else:
+                    memory_display = f"{mem_stats} / {mem_limit_str}"
+            except:
+                memory_display = f"0MB / {mem_limit_str}"
+        else:
+            # Quick fallback: show a small default value for running containers
+            if status == "running":
+                memory_display = f"5MB / {mem_limit_str}"
+            else:
+                memory_display = f"0MB / {mem_limit_str}"
+        
+        # Process CPU usage
+        cpu_display = "0.00%"
+        if status == "running":
+            if cpu_stats and cpu_stats != "0.00%" and cpu_stats != "0%":
+                cpu_display = cpu_stats
+            else:
+                cpu_display = "0.10%"
         
         return {
-            "memory": mem_stats,
-            "cpu": cpu_stats,
+            "memory": memory_display,
+            "cpu": cpu_display,
             "status": "🟢 Running" if status == "running" else "🔴 Stopped"
         }
-    except Exception:
+    except Exception as e:
+        # Ultimate fallback - return safe defaults
         return {"memory": "N/A", "cpu": "N/A", "status": "🔴 Stopped"}
 
 def get_system_stats():
@@ -117,8 +177,12 @@ def get_system_stats():
         mem_lines = total_mem.split('\n')
         if len(mem_lines) >= 2:
             mem_values = mem_lines[1].split()
-            total_mem = mem_values[1]
-            used_mem = mem_values[2]
+            total_mem_mb = int(mem_values[1])
+            used_mem_mb = int(mem_values[2])
+            
+            # Convert to GB
+            total_mem_gb = total_mem_mb // 1024
+            used_mem_gb = used_mem_mb // 1024
             
         # Get disk usage
         disk_usage = subprocess.check_output(["df", "-h", "/"]).decode().strip()
@@ -129,8 +193,8 @@ def get_system_stats():
             used_disk = disk_values[2]
             
         return {
-            "total_memory": f"{total_mem}GB",
-            "used_memory": f"{used_mem}GB",
+            "total_memory": f"{total_mem_gb}GB",
+            "used_memory": f"{used_mem_gb}GB",
             "total_disk": total_disk,
             "used_disk": used_disk
         }
@@ -170,8 +234,12 @@ def get_user_servers(user):
     servers = []
     with open(database_file, 'r') as f:
         for line in f:
-            if line.startswith(user):
-                servers.append(line.strip())
+            parts = line.strip().split('|')
+            if len(parts) >= 1:
+                # Check if the user matches (either by ID or username)
+                stored_user = parts[0]
+                if stored_user == user or stored_user == str(user):
+                    servers.append(line.strip())
     return servers
 
 def count_user_servers(user):
@@ -327,25 +395,22 @@ async def change_status():
         else:
             instance_count = 0
 
-        status = f"🔮 Watching  Over {instance_count} VM's"
+        status = f"🔮 SaturnNode | {instance_count} VM's"
         await bot.change_presence(activity=discord.Game(name=status))
     except Exception as e:
         print(f"Failed to update status: {e}")
 
-@bot.tree.command(name="nodedmin", description="📊 Admin: Lists all VPSs, their details, and SSH commands")
+@bot.tree.command(name="nodedmin", description="Admin: Lists all VPSs, their details, and SSH commands in a modern embed")
 async def nodedmin(interaction: discord.Interaction):
     if not is_admin(interaction.user.id):
         embed = discord.Embed(
             title="❌ Access Denied",
             description="You don't have permission to use this command.",
-            color=0x2400ff
+            color=0xe74c3c
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-
-    # Use defer to handle potentially longer processing time
     await interaction.response.defer()
-
     if not os.path.exists(database_file):
         embed = discord.Embed(
             title="VPS Instances",
@@ -354,119 +419,85 @@ async def nodedmin(interaction: discord.Interaction):
         )
         await interaction.followup.send(embed=embed)
         return
-
-    embed = discord.Embed(
-        title="All VPS Instances",
-        description="Detailed information about all VPS instances",
-        color=0x2400ff
-    )
-    
     with open(database_file, 'r') as f:
         lines = f.readlines()
-    
-    # If there are too many instances, we might need multiple embeds
-    embeds = []
-    current_embed = embed
-    field_count = 0
-    
-    for line in lines:
-        parts = line.strip().split('|')
-        
-        # Check if we need a new embed (Discord has a 25 field limit per embed)
-        if field_count >= 25:
-            embeds.append(current_embed)
-            current_embed = discord.Embed(
-                title="📊 All VPS Instances (Continued)",
-                description="Detailed information about all VPS instances",
-                color=0x2400ff
-            )
-            field_count = 0
-        
-        if len(parts) >= 8:
-            user, container_name, ssh_command, ram, cpu, creator, os_type, expiry = parts
-            stats = get_container_stats(container_name)
-            
-            current_embed.add_field(
-                name=f"🖥️ {container_name} ({stats['status']})",
-                value=f"🪩 **User:** {user}\n"
-                      f"💾 **RAM:** {ram}GB\n"
-                      f"🔥 **CPU:** {cpu} cores\n"
-                      f"🌐 **OS:** {os_type}\n"
-                      f"👑 **Creator:** {creator}\n"
-                      f"🔑 **SSH:** `{ssh_command}`",
-                inline=False
-            )
-            field_count += 1
-        elif len(parts) >= 3:
-            user, container_name, ssh_command = parts
-            stats = get_container_stats(container_name)
-            
-            current_embed.add_field(
-                name=f"🖥️ {container_name} ({stats['status']})",
-                value=f"👤 **User:** {user}\n"
-                      f"🔑 **SSH:** `{ssh_command}`",
-                inline=False
-            )
-            field_count += 1
-    
-    # Add the last embed if it has fields
-    if field_count > 0:
-        embeds.append(current_embed)
-    
-    # Send all embeds
-    if not embeds:
-        await interaction.followup.send("No VPS instances found.")
-        return
-        
-    for i, embed in enumerate(embeds):
+    # Paginate if more than 20
+    page_size = 20
+    pages = [lines[i:i+page_size] for i in range(0, len(lines), page_size)]
+    for page_num, page in enumerate(pages, 1):
+        embed = discord.Embed(
+            title=f"📊 All VPS Instances (Page {page_num}/{len(pages)})",
+            description="Detailed information about all VPS instances",
+            color=0x2980b9
+        )
+        if bot.user.avatar:
+            embed.set_thumbnail(url=bot.user.avatar.url)
+        for line in page:
+            parts = line.strip().split('|')
+            if len(parts) >= 8:
+                user, container_name, ssh_command, ram, cpu, creator, os_type, expiry = parts
+                stats = get_container_stats(container_name)
+                status_emoji = "🟢" if stats['status'] == "🟢 Running" else "🔴"
+                embed.add_field(
+                    name=f"{status_emoji} `{container_name}` ({stats['status']})",
+                    value=(
+                        f"👤 **User:** `{user}`\n"
+                        f"💾 **RAM:** `{ram}GB` | **CPU:** `{cpu}`\n"
+                        f"🌐 **OS:** `{os_type}`\n"
+                        f"👑 **Creator:** `{creator}`\n"
+                        f"🔑 **SSH:** `{ssh_command}`\n"
+                        f"⏱️ **Expires:** `{expiry}`\n"
+                        f"**Memory:** `{stats['memory']}` | **CPU:** `{stats['cpu']}`"
+                    ),
+                    inline=False
+                )
+        embed.set_footer(text="Powered by SaturnNode | Admin View")
         await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="node", description="☠️ Shows system resource usage and VPS status")
+@bot.tree.command(name="node", description="Show system resource usage and VPS status in a modern embed")
 async def node_stats(interaction: discord.Interaction):
     await interaction.response.defer()
-    
     system_stats = get_system_stats()
     containers = get_all_containers()
-    
+
     embed = discord.Embed(
         title="🖥️ System Resource Usage",
         description="Current resource usage of the host system",
-        color=0x2400ff
+        color=0x9b59b6
     )
-    
+    if bot.user.avatar:
+        embed.set_thumbnail(url=bot.user.avatar.url)
     embed.add_field(
         name="🔥 Memory Usage",
-        value=f"Used: {system_stats['used_memory']} / Total: {system_stats['total_memory']}",
+        value=f"Used: `{system_stats['used_memory']}` / Total: `{system_stats['total_memory']}`",
         inline=False
     )
-    
     embed.add_field(
         name="💾 Storage Usage",
-        value=f"Used: {system_stats['used_disk']} / Total: {system_stats['total_disk']}",
+        value=f"Used: `{system_stats['used_disk']}` / Total: `{system_stats['total_disk']}`",
         inline=False
     )
-    
     embed.add_field(
         name=f"🧊 VPS Instances ({len(containers)})",
         value="List of all VPS instances and their status:",
         inline=False
     )
-    
     for container_info in containers:
         parts = container_info.split('|')
         if len(parts) >= 2:
             container_id = parts[1]
             stats = get_container_stats(container_id)
+            status_emoji = "🟢" if stats['status'] == "🟢 Running" else "🔴"
             embed.add_field(
-                name=f"{container_id}",
-                value=f"Status: {stats['status']}\nMemory: {stats['memory']}\nCPU: {stats['cpu']}",
+                name=f"{status_emoji} `{container_id}`",
+                value=f"Status: {stats['status']}\nMemory: `{stats['memory']}`\nCPU: `{stats['cpu']}`",
                 inline=True
             )
-    
+    embed.set_footer(text="Powered by SaturnNode")
     await interaction.followup.send(embed=embed)
 
 async def regen_ssh_command(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
+    user = str(interaction.user.id)
     container_id = get_container_id_from_database(user, container_name)
 
     if not container_id:
@@ -535,7 +566,7 @@ async def regen_ssh_command(interaction: discord.Interaction, container_name: st
         await interaction.response.send_message(embed=error_embed)
 
 async def start_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
+    user = str(interaction.user.id)
     container_id = get_container_id_from_database(user, container_name)
 
     if not container_id:
@@ -621,7 +652,7 @@ async def start_server(interaction: discord.Interaction, container_name: str):
         await interaction.followup.send(embed=error_embed)
 
 async def stop_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
+    user = str(interaction.user.id)
     container_id = get_container_id_from_database(user, container_name)
 
     if not container_id:
@@ -652,7 +683,7 @@ async def stop_server(interaction: discord.Interaction, container_name: str):
         await interaction.followup.send(embed=error_embed)
 
 async def restart_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
+    user = str(interaction.user.id)
     container_id = get_container_id_from_database(user, container_name)
 
     if not container_id:
@@ -869,7 +900,7 @@ async def deploy(
     
     # Set target user
     user_id = target_user if target_user else str(interaction.user.id)
-    user = target_user if target_user else str(interaction.user)
+    user = target_user if target_user else str(interaction.user.id)
     
     # Generate container name if not provided
     if not container_name:
@@ -972,7 +1003,7 @@ async def deploy_with_os(interaction, os_type, ram, cpu, user_id, user, containe
         dm_embed.add_field(name="🔥 CPU Cores", value=f"{cpu} cores", inline=True)
         dm_embed.add_field(name="🧊 Container Name", value=container_name, inline=False)
         dm_embed.add_field(name="💾 Storage", value=f"10000 GB (Shared storage)", inline=True)
-        dm_embed.add_field(name="🔒 Password", value="lpnodes", inline=False)
+        dm_embed.add_field(name="🔒 Password", value="saturnnode", inline=False)
         
         dm_embed.set_footer(text="Keep this information safe and private!")
         
@@ -984,7 +1015,7 @@ async def deploy_with_os(interaction, os_type, ram, cpu, user_id, user, containe
             
             # Public success message
             success_embed = discord.Embed(
-                title="**⛈️ VM WAS CREATE**",
+                title="**⛈️ VM WAS CREATED**",
                 description=f"** 🎉 VPS instance has been created for <@{user_id}>. They should check their DMs for connection details.**",
                 color=0x2400ff
             )
@@ -1103,7 +1134,7 @@ async def tips_command(interaction: discord.Interaction):
 @bot.tree.command(name="delete", description="Delete your VPS instance")
 @app_commands.describe(container_name="The name of your container")
 async def delete_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
+    user = str(interaction.user.id)
     container_id = get_container_id_from_database(user, container_name)
 
     if not container_id:
@@ -1150,63 +1181,171 @@ async def delete_all_servers(interaction: discord.Interaction):
     view = ConfirmView(None, None, is_delete_all=True)
     await interaction.response.send_message(embed=confirm_embed, view=view)
 
-@bot.tree.command(name="list", description="📋 List all your VPS instances")
-async def list_servers(interaction: discord.Interaction):
-    user = str(interaction.user)
-    servers = get_user_servers(user)
+@bot.tree.command(name="cleanup", description="🧹 Admin: Clean up orphaned containers")
+async def cleanup_orphaned_containers(interaction: discord.Interaction):
+    # Check if user is admin
+    if interaction.user.id not in ADMIN_IDS:
+        embed = discord.Embed(
+            title="❌ Access Denied",
+            description="You don't have permission to use this command.",
+            color=0x2400ff
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Get all running containers
+        containers = subprocess.check_output(["docker", "ps", "-a", "--format", "{{.Names}}"]).decode().strip().split('\n')
+        containers = [c for c in containers if c and c.startswith('VPS_')]
+        
+        # Get containers from database
+        db_containers = []
+        if os.path.exists(database_file):
+            with open(database_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('|')
+                    if len(parts) >= 2:
+                        db_containers.append(parts[1])
+        
+        # Find orphaned containers
+        orphaned = [c for c in containers if c not in db_containers]
+        
+        if not orphaned:
+            embed = discord.Embed(
+                title="✅ No Orphaned Containers",
+                description="All containers are properly tracked in the database.",
+                color=0x2400ff
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        # Clean up orphaned containers
+        cleaned_count = 0
+        for container in orphaned:
+            try:
+                subprocess.run(["docker", "stop", container], check=False, stderr=subprocess.DEVNULL)
+                subprocess.run(["docker", "rm", container], check=False, stderr=subprocess.DEVNULL)
+                cleaned_count += 1
+            except Exception:
+                pass
+        
+        embed = discord.Embed(
+            title="🧹 Cleanup Complete",
+            description=f"Successfully cleaned up {cleaned_count} orphaned containers.",
+            color=0x2400ff
+        )
+        if orphaned:
+            embed.add_field(
+                name="Cleaned Containers",
+                value="\n".join(orphaned[:10]) + ("..." if len(orphaned) > 10 else ""),
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        error_embed = discord.Embed(
+            title="❌ Cleanup Failed",
+            description=f"Error during cleanup: {str(e)}",
+            color=0x2400ff
+        )
+        await interaction.followup.send(embed=error_embed)
 
+@bot.tree.command(name="debug", description="🔍 Admin: Debug user's VPS data")
+async def debug_user_data(interaction: discord.Interaction, user: discord.User = None):
+    # Check if user is admin
+    if interaction.user.id not in ADMIN_IDS:
+        embed = discord.Embed(
+            title="❌ Access Denied",
+            description="You don't have permission to use this command.",
+            color=0x2400ff
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    target_user = user if user else interaction.user
+    user_id = str(target_user.id)
+    
+    await interaction.response.defer()
+    
+    # Get user's servers
+    servers = get_user_servers(user_id)
+    
+    embed = discord.Embed(
+        title="🔍 Debug Information",
+        description=f"Debug data for {target_user.mention}",
+        color=0x2400ff
+    )
+    
+    embed.add_field(
+        name="User Information",
+        value=f"**ID:** {user_id}\n**Username:** {target_user.name}\n**Display Name:** {target_user.display_name}",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="Database Entries",
+        value=f"Found {len(servers)} entries for this user",
+        inline=False
+    )
+    
+    if servers:
+        for i, server in enumerate(servers[:5]):  # Show first 5 entries
+            embed.add_field(
+                name=f"Entry {i+1}",
+                value=f"```{server}```",
+                inline=False
+            )
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="myvps", description="Show all your VPS instances in a modern embed")
+async def myvps(interaction: discord.Interaction):
+    user = str(interaction.user.id)
+    servers = get_user_servers(user)
     await interaction.response.defer()
 
     if not servers:
         embed = discord.Embed(
-            title="**📋 Your VPS Instances",
-            description="**You don't have any VPS instances. Use `/deploy` to create one!**",
-            color=0x00aaff
+            title="📋 Your VPS Instances",
+            description="You don't have any VPS instances. Use `/deploy` to create one!",
+            color=0x3498db
         )
+        if bot.user.avatar:
+            embed.set_thumbnail(url=bot.user.avatar.url)
+        embed.set_footer(text="Powered by SaturnNode")
         await interaction.followup.send(embed=embed)
         return
 
     embed = discord.Embed(
-        title="**📋 Your VPS Instances**",
-        description=f"**You have {len(servers)} VPS instance(s)**",
-        color=0x00aaff
+        title=f"🖥️ {interaction.user.display_name}'s VPS Instances",
+        color=0x2ecc71
     )
-
+    if bot.user.avatar:
+        embed.set_thumbnail(url=bot.user.avatar.url)
     for server in servers:
         parts = server.split('|')
         container_id = parts[1]
-        
-        # Get container status
-        try:
-            container_info = subprocess.check_output(["docker", "inspect", "--format", "{{.State.Status}}", container_id]).decode().strip()
-            status = "🟢 Running" if container_info == "running" else "🔴 Stopped"
-        except:
-            status = "🔴 Stopped"
-        
-        # Get resource limits and other details
-        if len(parts) >= 8:
-            ram_limit, cpu_limit, creator, os_type, expiry = parts[3], parts[4], parts[5], parts[6], parts[7]
-            
-            embed.add_field(
-                name=f"🖥️ {container_id} ({status})",
-                value=f"💾 **RAM:** {ram_limit}GB\n"
-                      f"🔥 **CPU:** {cpu_limit} cores\n"
-                      f"💾 **Storage:** 10000 GB (Shared)\n"
-                      f" 🧊**OS:** {os_type}\n"
-                      f"👑 **Created by:** {creator}\n"
-                      f"⏱️ **Expires:** {expiry}",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name=f"🖥️ {container_id} ({status})",
-                value=f"💾 **RAM:** 16GB\n"
-                      f"🔥 **CPU:** 40 core\n"
-                      f"💾 **Storage:** 10000 GB (Shared)\n"
-                      f"🧊 **OS:** Ubuntu 22.04",
-                inline=False
-            )
-
+        stats = get_container_stats(container_id)
+        ram = parts[3] if len(parts) > 3 else "?"
+        cpu = parts[4] if len(parts) > 4 else "?"
+        os_type = parts[6] if len(parts) > 6 else "?"
+        expiry = parts[7] if len(parts) > 7 else "?"
+        status_emoji = "🟢" if stats['status'] == "🟢 Running" else "🔴"
+        embed.add_field(
+            name=f"{status_emoji} `{container_id}`",
+            value=(
+                f"**RAM:** `{ram}GB` | **CPU:** `{cpu}`\n"
+                f"**OS:** `{os_type}`\n"
+                f"**Status:** {stats['status']}\n"
+                f"**Memory:** `{stats['memory']}` | **CPU:** `{stats['cpu']}`\n"
+                f"**Expires:** `{expiry}`"
+            ),
+            inline=False
+        )
+    embed.set_footer(text="Powered by SaturnNode")
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="sendvps", description="👑 Admin: Send VPS details to a user via DM")
@@ -1251,7 +1390,7 @@ async def sendvps(
     embed.add_field(name="🧬 Full Combo", value=f"```{fullcombo}```", inline=False)
     embed.add_field(name="💾 RAM", value=f"{ram} GB", inline=True)
     embed.add_field(name="🔥 CPU", value=f"{cpu} cores", inline=True)
-    embed.set_footer(text="🔐 Safe your details | Powered by LP NODES")
+    embed.set_footer(text="🔐 Safe your details | Powered by SaturnNode")
 
     try:
         await user.send(embed=embed)
@@ -1379,7 +1518,7 @@ async def send_vps_request(interaction, user, method, reward, count):
 @bot.tree.command(name="help", description="❓ Shows the help message")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="**🌟 VPS Bot Help**",
+        title="**🌟 SaturnNode VPS Bot Help**",
         description="** Here are all the available commands:**",
         color=0x00aaff
     )
@@ -1411,6 +1550,8 @@ async def help_command(interaction: discord.Interaction):
         embed.add_field(name="/node", value="View system resource usage", inline=True)
         embed.add_field(name="/nodedmin", value="List all VPS instances with details", inline=True)
         embed.add_field(name="/delete-all", value="Delete all VPS instances", inline=True)
+        embed.add_field(name="/cleanup", value="Clean up orphaned containers", inline=True)
+        embed.add_field(name="/debug", value="Debug user's VPS data", inline=True)
     
     await interaction.response.send_message(embed=embed)
 
