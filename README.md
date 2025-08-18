@@ -2,7 +2,7 @@
 git clone https://github.com/dpworldog/DP-VPS
 ```
 ```
-cd LP-VPS
+cd DP-VPS
 ```
 ```
 apt install docker.io && apt install pip
