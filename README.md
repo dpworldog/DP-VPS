@@ -1,5 +1,5 @@
 ```
-git clone https://github.com/dpworldog/LP-VPS
+git clone https://github.com/dpworldog/DP-VPS
 ```
 ```
 cd LP-VPS
